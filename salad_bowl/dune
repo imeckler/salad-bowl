@@ -1,0 +1,5 @@
+(library
+ (libraries core async)
+ (preprocess
+  (pps ppx_jane))
+ (name salad_bowl))

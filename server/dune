@@ -1,0 +1,5 @@
+(executable
+ (libraries salad_bowl core async)
+ (preprocess
+  (pps ppx_jane))
+ (name server))
