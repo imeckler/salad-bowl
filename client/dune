@@ -1,0 +1,5 @@
+(executable
+ (libraries js_of_ocaml salad_bowl core_kernel async_kernel incr_dom async_rpc_kernel async_js)
+ (preprocess
+  (pps js_of_ocaml.ppx ppx_jane))
+ (name client))
