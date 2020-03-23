@@ -5,7 +5,7 @@ open Async
 module App_state = struct
   type per_game = 
     { game      : Game.t
-    ; listeners : (Player_id.t * Game.View.state Pipe.Writer.t sexp_opaque) list
+    ; listeners : Game.View.state Pipe.Writer.t sexp_opaque Player_id.Map.t
     }
   [@@deriving sexp]
 
@@ -26,7 +26,7 @@ let initiate (state : App_state.t) (q : Rpcs.Initiate.query) =
       let r, w = Pipe.create () in
       let state, player, game =
           match q with
-          | Create_game player -> 
+          | Create_game { creator; words_per_player } -> 
             let game = Game_id.create () in
             { state with games=
                 Game_id.Map.set state.games
@@ -34,20 +34,26 @@ let initiate (state : App_state.t) (q : Rpcs.Initiate.query) =
                   ~data:{
                     game=
                       Players_joining
-                        { players=Player_id.Set.singleton player
-                        ; admin= player
+                        { players=Player_id.Set.singleton creator
+                        ; admin= creator
+                        ; words_per_player
                         };
-                    listeners=[(player, w)]
+                    listeners=Player_id.Map.singleton creator w
                   }
             }
-            , player
+            , creator
             , game
           | Join_game (player, game) ->
             { state with games=
               Map.update state.games game ~f:(function
                 | Some {game=Players_joining g; listeners } ->
                   { game= Players_joining { g with players= Set.add g.players player }
-                  ; listeners= (player, w) :: listeners
+                  ; listeners= 
+                      Map.update listeners player ~f:(function
+                          | Some old ->
+                            Pipe.close old ;
+                            w
+                          | None -> w)
                   }
                 | _ -> return (Or_error.error_string "Game not joinable" )
               )
@@ -63,13 +69,40 @@ let register (state : App_state.t) (q : string) =
 
 let port = 8001
 
+let move (state : App_state.t) (player, game_id, u) : App_state.t =
+  match Map.find state.games game_id with
+  | None -> state
+  | Some { game; listeners } ->
+    match 
+      Game.update ~now:(Time.now()) ~player 
+        game u
+    with
+    | Error Game_finished ->
+      Map.iter listeners ~f:(fun w ->
+          (* TODO: Delete pipe if closed *)
+          Pipe.write_without_pushback_if_open w
+            Finished ;
+          Pipe.close w 
+        ) ;
+      { state with games= Map.remove state.games game_id }
+    | Error Word_already_present
+    | Error Full_words
+    | Error Wrong_player_id
+    | Error Invalid_transition -> state
+    | Ok game ->
+      Map.iteri listeners ~f:(fun ~key:p ~data:w ->
+          let view = Game.view state.players p game in
+          (* TODO: Delete pipe if closed *)
+          Pipe.write_without_pushback_if_open w
+            view ;
+        ) ;
+      { state with games= Map.set state.games ~key:game_id ~data:{ game; listeners } }
+
 let main () =
   let get_state, set_state =
     let r = ref App_state.init in
     ( (fun () -> !r),
-      (fun s ->
-(*          Core.printf !"state: %{sexp: App_state.t}\n%!" s ; *)
-         r := s) )
+      (fun s -> r := s) )
   in
   let%bind _ =
     Tcp.Server.create
@@ -79,12 +112,7 @@ let main () =
       (fun _ sock_r sock_w -> 
          let to_client_r, to_client_w = Pipe.create () in
          let from_client_r, from_client_w = Pipe.create () in
-
-         (*
-         let ws_r, ws_w = Pipe.cre
-         let bytes_r, bytes_w = Pipe.create () in
-            *)
-         let _stop = 
+         let stop = 
           Websocket_async.server
             ~check_request:(fun _req ->
                 Core.printf "hi%!\n%!";
@@ -121,6 +149,17 @@ let main () =
            in
            Rpc.Transport.of_reader_writer ~max_message_size:10_000 r w
         in
+        let remove_listener game player =
+          let s = get_state () in
+          Option.iter (Map.find s.games game) ~f:(fun g ->
+              let listeners' = Map.remove g.listeners player in
+              let s' =
+                if Map.is_empty listeners'
+                then { s with games = Map.remove s.games game }
+                else { s with games = Map.set s.games ~key:game ~data:{ g with listeners= listeners' } }
+              in
+              set_state s' )
+        in
         Async.Rpc.Connection.serve_with_transport
           ~handshake_timeout:(Some (Time.Span.of_sec 10.))
           ~heartbeat_config:None
@@ -148,7 +187,9 @@ let main () =
 
                           let {App_state.game;listeners} = Map.find_exn s.games g in
 
-                          List.iter listeners ~f:(fun (p', w) ->
+                          upon stop (fun _ -> remove_listener g p) ;
+
+                          Map.iteri listeners ~f:(fun ~key:p' ~data:w ->
                               if Player_id.(p <> p') then
                               Pipe.write_without_pushback_if_open w
                                 (Game.view s.players p' game) );
@@ -159,28 +200,7 @@ let main () =
                         end
                     )
                 ; Rpc.One_way.implement Rpcs.Move.t 
-                    (fun () (player, game_id, u) ->
-                        match Map.find (get_state ()).games game_id with
-                        | None -> ()
-                        | Some { game; listeners } ->
-                          Core.printf !"Move: %{sexp:Game.Update.t}\n%!" u ;
-                          Core.printf !"before: %{sexp:Game.t}\n%!" game ;
-                          match 
-                            Game.update ~now:(Time.now()) ~player 
-                              game u
-                          with
-                          | Error e -> 
-                            eprintf !"move %s %{sexp:error}\n%!" __LOC__  e ;
-                            ()
-                          | Ok game ->
-                            Core.printf !"after: %{sexp:Game.t}\n%!" game ;
-                            set_state
-                              { (get_state ()) with games= Map.set (get_state ()).games ~key:game_id ~data:{ game; listeners } } ;
-                            List.iter listeners ~f:(fun (p, w) ->
-                                let view = Game.view (get_state ()).players p game in
-                                Pipe.write_without_pushback_if_open w
-                                  view ;
-                              ) )
+                    (fun () q -> set_state (move (get_state ()) q) )
                 ] )
           transport
       )

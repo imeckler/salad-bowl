@@ -8,6 +8,6 @@ bash build.sh
 dune build server/server.exe
 dune exec server/server.exe &
 
-trap 'kill $(jobs -p)' EXIT
+trap 'killall $(jobs -p)' EXIT
 
 sleep infinity

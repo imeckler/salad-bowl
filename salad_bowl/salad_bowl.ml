@@ -6,6 +6,8 @@ module Game_id = Unique_id.Int()
 type error =
   | Game_finished
   | Wrong_player_id
+  | Word_already_present
+  | Full_words
   | Invalid_transition
 [@@deriving sexp]
 
@@ -33,7 +35,9 @@ module Time = struct
   include Time
 end
 
-let subround_length = Time.Span.of_min 2.
+let subround_length =
+(*   Time.Span.of_min 2. *)
+  Time.Span.of_sec 10.
 
 module Pair(F: sig
     type _ t [@@deriving bin_io, sexp]
@@ -51,8 +55,12 @@ module Game = struct
     type 'a t =
       { players: 'a array
       ; active: int
+      ; score: int
       }
     [@@deriving sexp, bin_io]
+
+    let increase_score t =
+      { t with score= t.score + 1 }
 
     let map t ~f =
       { t with
@@ -62,6 +70,7 @@ module Game = struct
     let create players =
       { players= Array.of_list players
       ; active=0
+      ; score=0
       }
 
     let advance t =
@@ -109,6 +118,15 @@ module Game = struct
         in
         team.players.(team.active)
 
+      let increase_score t =
+        let teams =
+          let (a, b) = t.teams in
+          match t.active with
+          | `A -> (Team_state.increase_score a, b)
+          | `B -> (a, Team_state.increase_score b)
+        in
+        { t with teams }
+
       let advance { active; teams=(a,b) } =
         let (active, teams) =
           match active with
@@ -142,14 +160,61 @@ module Game = struct
       { t with teams= Team_states.advance t.teams }
   end
 
+  module Collecting_words : sig
+    type t
+    [@@deriving bin_io, sexp]
+
+    val create: words_per_player:int -> t
+
+    val add : t -> Player_id.t -> string -> [ `Already_present | `Full | `Ok of t ]
+
+    val for_player: t -> Player_id.t -> string list option
+
+    val to_list : t -> string list
+  end = struct
+    type t =
+      { by_player: String.Set.t Player_id.Map.t
+      ; all: String.Set.t
+      ; words_per_player: int
+      }
+    [@@deriving bin_io, sexp]
+
+    let create ~words_per_player =
+      { by_player= Player_id.Map.empty; all= String.Set.empty 
+      ; words_per_player
+      }
+
+    let for_player { by_player; _ } player =
+      Option.map (Map.find by_player player)
+        ~f:Set.to_list
+
+    let to_list { all; _ } = Set.to_list all
+
+    let add { by_player; all; words_per_player } p w =
+      if Set.mem all w
+      then `Already_present
+      else
+        with_return (fun { return } ->
+        `Ok
+          { all = String.Set.add all w
+          ; by_player= Map.update by_player p ~f:(function
+                | None -> String.Set.singleton w
+                | Some ws ->
+                  if Set.length ws >= words_per_player
+                  then return `Full
+                  else Set.add ws w )
+          ; words_per_player 
+          })
+  end
+
   type t =
-    | Players_joining of { players: Player_id.Set.t; admin: Player_id.t }
-    | Collecting_words of { teams: Player_id.t Teams.t ; words: string list Player_id.Map.t; admin: Player_id.t }
+    | Players_joining of { players: Player_id.Set.t; admin: Player_id.t; words_per_player: int }
+    | Collecting_words of { teams: Player_id.t Teams.t ; words: Collecting_words.t; admin: Player_id.t }
     | Running of Running.t
   [@@deriving bin_io, sexp]
 
-  let init admin =
-    Players_joining { players=Player_id.Set.empty; admin }
+  let init admin words_per_player =
+    Players_joining { players=Player_id.Set.empty; admin; words_per_player  }
 
   module Update = struct
     (* All updates will come with the player so we check if it's valid *)
@@ -169,21 +234,22 @@ module Game = struct
     match game, u with
     | Players_joining r, Join ->
       Players_joining { r with players=Set.add r.players player }
-    | Players_joining { players; admin }, Finalize_players ->
-      printf "%s :)\n%!" __LOC__ ;
+    | Players_joining { players; admin; words_per_player }, Finalize_players ->
       if Player_id.equal player admin
       then
         let n = Set.length players / 2 in
         let teams = List.split_n (Set.to_list players) n in
-        Collecting_words {admin; teams;words= Player_id.Map.empty}
+        Collecting_words {admin; teams;words= Collecting_words.create ~words_per_player}
       else
         game
     | Collecting_words r, Add_word w ->
       Collecting_words
         { r with
-          words= Map.update r.words player ~f:(function
-             | None -> [ w ]
-             | Some ws -> w :: ws )
+          words= 
+            match Collecting_words.add r.words player w with
+            | `Ok ws -> ws
+            | `Already_present -> raise (E Word_already_present)
+            | `Full -> raise (E Full_words)
         }
     | Collecting_words { teams=(a, b); words; admin=_ }, Finalize_words ->
       Running
@@ -192,10 +258,7 @@ module Game = struct
             ; active= `A
             }
         ; subround_start= None
-        ; words=
-          Words.create (
-            List.concat (Map.data words)
-            |> List.dedup_and_sort ~compare:String.compare )
+        ; words=Words.create (Collecting_words.to_list words)
         ; round= Describe 
         }
     | Running g, Start_subround ->
@@ -224,10 +287,11 @@ module Game = struct
       if Running.current_subround_over ~now g then game else
         begin match Words.next g.words with
         | None -> game
-        | Some ws -> Running { g with words = ws }
+        | Some ws ->
+          let g = { g with teams = Running.Team_states.increase_score g.teams } in
+          Running { g with words = ws }
         end
     | _ ->
-      printf ":0 oh no %s\n%!" __LOC__ ;
       raise (E Invalid_transition)
 
   let update ~now ~player game u =
@@ -255,7 +319,7 @@ module Game = struct
 
   let view registered_players player game : View.state =
     match game with
-    | Players_joining { players=ps; admin } ->
+    | Players_joining { players=ps; admin; words_per_player=_ } ->
       Players_joining
         { players=List.map (Set.to_list ps)
               ~f:(Map.find_exn registered_players) 
@@ -263,9 +327,8 @@ module Game = struct
         }
     | Collecting_words { teams=ts; words=wss; admin } ->
       let ws =
-        match Map.find wss player with
-        | Some ws -> ws
-        | None -> []
+        Option.value (Collecting_words.for_player wss player)
+          ~default:[]
       in
       let teams = Teams.map ts ~f:(Map.find_exn registered_players) in
       Collecting_words {teams; words= ws; admin= Player_id.equal player admin }
@@ -302,7 +365,7 @@ module Rpcs = struct
 
   module Initiate = struct
     type query = 
-      | Create_game of Player_id.t
+      | Create_game of { creator: Player_id.t; words_per_player: int }
       | Join_game of Player_id.t * Game_id.t
     [@@deriving bin_io, sexp]
 

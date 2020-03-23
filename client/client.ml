@@ -42,22 +42,26 @@ end
 
 let view_team name t =
   let open Vdom in
-  Node.div []
-    [ ksprintf Node.text "Team %s" name
+  Node.div
+    [ Attr.class_ "team" 
+    ; Attr.style
+        (Css_gen.flex_item ~grow:1. ())
+    ]
+    [ Node.h3 [] [ ksprintf Node.text "Team %s" name ]
     ; Node.ul []
         (List.map t ~f:(fun x ->
             Node.li [] [ Node.text x ] ))
     ]
 
 let view ~now (s : State.t) ~inject =
- printf "Calling view\n%!";
  let open Vdom in
- let button text action =
+ let button ?(visible=true) text action =
   Node.button
-      [ Attr.type_ "button" 
+      ([ Attr.type_ "button" 
       ; Attr.on_click (fun _ ->
             inject action )
-      ]
+      ] @ if visible then [] else [ Attr.style (Css_gen.display `None) ]
+      )
       [ Node.text text
       ]
   in
@@ -65,7 +69,7 @@ let view ~now (s : State.t) ~inject =
   | Enter_name _curr ->
     Node.div
       []
-      [ Node.text "Enter name"
+      [ Node.div [] [Node.h3 [] [ Node.text "Enter name"] ]
       ; Node.input
           [ Attr.type_ "text"
           ; Attr.on_input (fun _ x ->
@@ -88,18 +92,34 @@ let view ~now (s : State.t) ~inject =
   | Join_or_create_game (player, game_id)  ->
     Node.div
       []
-      [ Node.button
-          [ Attr.type_ "button" 
-          ; Attr.on_click (fun _ ->
-                inject
-                  (Action.Join_or_create_game
-                     (Create_game player)
-                  ) )
+      [ Node.div []
+          [ Node.input
+              [ Attr.type_ "text"
+              ; Attr.id "words-per-player"
+              ]
+              []
+          ; Node.button
+            [ Attr.type_ "button" 
+            ; Attr.on_click (fun _ ->
+                  let e = Dom_html.getElementById_exn "words-per-player" in
+                  let value = (Js.string "value") in
+                  let w =
+                    Js.to_string (Js.Unsafe.get e value)
+                  in
+                  match Option.try_with (fun () -> Int.of_string w) with
+                  | None -> Event.Ignore
+                  | Some n ->
+                    inject
+                      (Action.Join_or_create_game
+                        (Create_game {creator=player; words_per_player=n})
+                      )  )
+            ]
+            [ Node.text "Create game"
+            ]
           ]
-          [ Node.text "Create game"
-          ]
+      ; Node.hr []
       ; Node.div []
-        [ Node.text "Join game"
+        [ Node.h3 [] [ Node.text "Or, join game" ]
         ; Node.input
             [ Attr.type_ "text"
             ; Attr.on_input (fun _ x ->
@@ -155,9 +175,14 @@ let view ~now (s : State.t) ~inject =
         []
         (
         [ Node.div [] [ksprintf Node.text "Game ID: %s" (Game_id.to_string game)]
+        ; Node.div
+            [ Attr.style
+                (Css_gen.create ~field:"display" ~value:"flex")
+            ]
+            [ view_team "A" a
+            ; view_team "B" b
+            ]
         ; Node.div [] [Node.text "Enter words"]
-        ; view_team "A" a
-        ; view_team "B" b
         ; Node.input
             [ Attr.type_ "text"
             ; Attr.id "word-entry"
@@ -178,8 +203,7 @@ let view ~now (s : State.t) ~inject =
             ]
             []
         ; Node.div []
-            [ Node.text "Your words"
-            ; Node.ul []
+            [ Node.ul []
                 (List.map words ~f:(fun x -> Node.li [] [ Node.text x ] ) )
             ]
         ]
@@ -199,7 +223,7 @@ let view ~now (s : State.t) ~inject =
       ] else [] )
     | Finished -> Node.text "That's all folks!"
     | Running { round; teams; subround_start; current_word  } ->
-      let view_team name ({ active; players } : _ Game.Team_state.t) =
+      let view_team name ({ active; players; score } : _ Game.Team_state.t) =
         let players =
           Array.mapi players ~f:(fun i (_, player) ->
               let attrs =
@@ -213,8 +237,14 @@ let view ~now (s : State.t) ~inject =
             )
           |> Array.to_list
         in
-        Node.div []
-          [ ksprintf Node.text "Team %s" name
+        Node.div
+          [ Attr.style
+              (Css_gen.flex_item ~grow:1. ())
+          ]
+          [ Node.h3 [] [ ksprintf Node.text "Team %s" name ]
+          ; Node.div []
+              [ ksprintf Node.text "Score: %d" score
+              ]
           ; Node.ul [] players
           ]
       in
@@ -254,24 +284,25 @@ let view ~now (s : State.t) ~inject =
           else 
             match current_word with
             | `Out_of_words -> `Out_of_words
-            | `Not_your_turn | `Word _ -> `Time_remaining remaining
+            | `Not_your_turn -> `Time_remaining (remaining, None)
+            | `Word w -> `Time_remaining (remaining, Some w)
       in
       let time_remaining =
         match round_state with
         | `Waiting_to_start -> Node.text "Waiting to start round."
         | `Out_of_words | `No_time_remaining ->
               Node.text "Round over. Waiting to start new round."
-        | `Time_remaining remaining ->
+        | `Time_remaining (remaining, _) ->
           let parts = Time.Span.to_parts remaining in
           ksprintf Node.text "%d:%02d remaining."
             parts.min
             parts.sec
       in
       let current_word =
-        match current_word with
+        match round_state with
         | `Out_of_words -> [ Node.text "All words have been used. On to the next round!" ]
-        | `Not_your_turn -> []
-        | `Word w ->
+        | `Waiting_to_start | `No_time_remaining | `Time_remaining (_ , None) -> []
+        | `Time_remaining (_, Some w) ->
           [ Node.div []
             [ Node.div [] [ Node.text "You're up!" ]
             ; Node.div [] [ ksprintf Node.text "Current word: %s" w ]
@@ -292,26 +323,31 @@ let view ~now (s : State.t) ~inject =
       let start_round =
         match round_state with
         | `Time_remaining _ -> []
-        | `No_time_remaining
         | `Waiting_to_start ->
           if am_curr
           then
-            [ button "Start the round" (In_game Start_subround) ]
+            [ button "Start" (In_game Start_subround) ]
           else []
+        | `No_time_remaining
         | `Out_of_words ->
           if am_next
           then
-            [ button "Start next round" (In_game Start_subround) ]
+            [ button "Start" (In_game Start_subround) ]
           else []
       in
       let (a, b) = teams.teams in
       Node.div []
-        ([ view_team "A" a
-        ; view_team "B" b
+        ([ Node.div
+             [ Attr.style
+                 (Css_gen.flex_container ~direction:`Row ())
+             ]
+             [ view_team "A" a
+             ; view_team "B" b
+             ]
         ; Node.h3 [] [ Node.text "Current round" ]
         ; Node.div [] [ round ]
         ; Node.div [] [ time_remaining ]
-        ; button "do nothing" (Action.Update_name "")
+        ; button ~visible:false "do nothing" (Action.Update_name "")
         ]
         @ current_word
         @ start_round )
@@ -325,8 +361,10 @@ module App = struct
   module State = Rpc.Connection
 
   let on_startup ~schedule_action:_ _model =
+    let url = "localhost" in
+    let _url = "hwsrv-486039.hostwindsdns.com" in
     Rpc.Connection.client_exn
-      ~uri:(Uri.of_string "ws://localhost:8001")
+      ~uri:(ksprintf Uri.of_string "ws://%s:8001" url)
       ()
 
   let apply_action (m: Model.t) (a:Action.t) conn ~schedule_action : Model.t =
@@ -346,7 +384,9 @@ module App = struct
     | Join_or_create_game (player, _) , Join_or_create_game q ->
       don't_wait_for begin
         match%bind Rpc.State_rpc.dispatch Rpcs.Initiate.t conn q with
-        | Ok Error e | Error e -> printf !"Join error: %{sexp:Error.t}\n%!" e ; Deferred.unit
+        | Ok Error e | Error e -> 
+          printf !"Join error: %{sexp:Error.t}\n%!" e ;
+          Deferred.unit
         | Ok (Ok (s0, ss, _)) ->
           schedule_action (Initial_game s0) ;
           Pipe.iter_without_pushback ss ~f:(fun s ->
@@ -362,34 +402,11 @@ module App = struct
 
   let create model ~old_model:_ ~inject =
     let open Incr.Let_syntax in
-    let%bind now = 
-      let%map () = 
-        let%map () =
-          Incr.Clock.at_intervals
-            Incr.clock (Time_ns.Span.of_sec 0.05)
-        in
-        printf "firing!\n%!"
-      and now =
-        Incr.Clock.watch_now Incr.clock
-      in
-      now
-    in
-    let%map model = model in
-    let apply_action = apply_action model in
-    let view = view model ~inject ~now:(Time_ns.to_time_float_round_nearest now) in
-    Component.create ~apply_action model view
-
-(*
-  let create model ~old_model:_ ~inject =
-    let open Incr.Let_syntax in
     let%map model = model
     and now =
       let%map () =
-        let%map () =
-          Incr.Clock.at_intervals
-            Incr.clock (Time_ns.Span.of_sec 0.05)
-        in
-        printf "firing\n%!"
+        Incr.Clock.at_intervals
+          Incr.clock (Time_ns.Span.of_sec 0.05)
       and now =
         Incr.Clock.watch_now Incr.clock
       in
@@ -398,7 +415,6 @@ module App = struct
     let apply_action = apply_action model in
     let view = view model ~inject ~now:(Time_ns.to_time_float_round_nearest now) in
     Component.create ~apply_action model view
-*)
 end
 
 let () =
